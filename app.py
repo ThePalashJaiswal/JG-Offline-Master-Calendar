@@ -32,6 +32,24 @@ try:
 except RuntimeError as exc:  # missing DATABASE_URL
     st.error(str(exc))
     st.stop()
+except Exception as exc:  # cannot reach / log in to the database: show a safe diagnosis
+    from sqlalchemy.engine import make_url
+
+    from jgevents.config import database_url
+    try:
+        u = make_url(database_url())
+        target = f"user `{u.username}` at `{u.host}:{u.port}` / database `{u.database}`"
+        secret = u.password or ""
+    except Exception:
+        target, secret = "an unparseable DATABASE_URL (check for @ # / ? : % in the password)", ""
+    reason = str(getattr(exc, "orig", None) or exc).strip().splitlines()[0][:400]
+    if secret:
+        reason = reason.replace(secret, "•••")
+    st.error(f"**Cannot connect to the database.** Tried {target}.\n\nDatabase says: `{reason}`")
+    st.caption("Common fixes: use Supabase's Session pooler string (port 5432) copied from the Connect button; "
+               "remove [ ] around the password; use a password of letters and digits only. "
+               "After editing Secrets, reboot the app.")
+    st.stop()
 
 user = core.current_user()
 if user is None:
