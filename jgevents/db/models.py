@@ -227,6 +227,12 @@ class Event(TimestampMixin, Base):
     post_event_remarks: Mapped[str | None] = mapped_column(Text)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # v2 – pre-event readiness
+    booked_late: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    late_reason: Mapped[str | None] = mapped_column(Text)
+    late_approved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id",
+                                                                   name="fk_events_late_approved_by"))
+
     created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     updated_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
@@ -305,3 +311,133 @@ class AppSetting(Base):
     key: Mapped[str] = mapped_column(String(80), primary_key=True)
     value: Mapped[Any] = mapped_column(JSONType)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, onupdate=now_utc)
+
+
+# ---------------------------------------------------------------- v2: pre-event readiness playbooks
+
+TASK_SCOPES = ("centre", "national")
+PROOF_TYPES = ("none", "url", "count", "seats", "whatsapp_auto")
+TASK_STATUSES = ("open", "done", "waived", "closed", "not_needed")
+
+
+class Playbook(Base):
+    """A versioned set of preparation tasks for one event category. Exactly one
+    version per category is active; events keep the version they were built from."""
+    __tablename__ = "playbooks"
+    __table_args__ = (UniqueConstraint("category_id", "version", name="uq_playbook_category_version"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    category_id: Mapped[int] = mapped_column(ForeignKey("event_categories.id", ondelete="RESTRICT"), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+
+    category: Mapped[EventCategory] = relationship(lazy="joined")
+    tasks: Mapped[list[PlaybookTask]] = relationship(back_populates="playbook", lazy="selectin",
+                                                     order_by="PlaybookTask.sort_order")
+
+
+class PlaybookTask(Base):
+    __tablename__ = "playbook_tasks"
+    __table_args__ = (
+        UniqueConstraint("playbook_id", "key", name="uq_playbook_task_key"),
+        CheckConstraint(_in("scope", TASK_SCOPES), name="ck_pbt_scope"),
+        CheckConstraint(_in("proof_type", PROOF_TYPES), name="ck_pbt_proof"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    playbook_id: Mapped[int] = mapped_column(ForeignKey("playbooks.id", ondelete="CASCADE"), nullable=False)
+    key: Mapped[str] = mapped_column(String(10), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    offset_days: Mapped[int] = mapped_column(Integer, nullable=False)  # -7 = T-7, +2 = T+2
+    owner_label: Mapped[str] = mapped_column(String(60), nullable=False)
+    is_critical: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    scope: Mapped[str] = mapped_column(String(10), default="centre", nullable=False)
+    depends_on: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    proof_type: Mapped[str] = mapped_column(String(20), default="none", nullable=False)
+    proof_label: Mapped[str | None] = mapped_column(String(120))
+    skip_if_mode: Mapped[str | None] = mapped_column(String(60))  # e.g. "Online"
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    playbook: Mapped[Playbook] = relationship(back_populates="tasks")
+
+
+class EventTask(TimestampMixin, Base):
+    """A concrete preparation task generated for one event from a playbook task.
+    Stored as a snapshot so later playbook edits never alter existing events."""
+    __tablename__ = "event_tasks"
+    __table_args__ = (
+        UniqueConstraint("event_id", "key", name="uq_event_task_key"),
+        CheckConstraint(_in("status", TASK_STATUSES), name="ck_event_task_status"),
+        CheckConstraint(_in("proof_type", PROOF_TYPES), name="ck_event_task_proof"),
+        CheckConstraint("proof_count IS NULL OR proof_count >= 0", name="ck_event_task_count"),
+        CheckConstraint("proof_count2 IS NULL OR proof_count2 >= 0", name="ck_event_task_count2"),
+        Index("ix_event_tasks_due", "due_date"),
+        Index("ix_event_tasks_centre_due", "centre_id", "due_date"),
+        Index("ix_event_tasks_status", "status"),
+    )
+    id: Mapped[int] = mapped_column(primary_key=True)
+    event_id: Mapped[int] = mapped_column(ForeignKey("events.id", ondelete="RESTRICT"), nullable=False, index=True)
+    centre_id: Mapped[int | None] = mapped_column(ForeignKey("centres.id", ondelete="RESTRICT"))
+    playbook_task_id: Mapped[int | None] = mapped_column(ForeignKey("playbook_tasks.id", ondelete="SET NULL"))
+    playbook_version: Mapped[int | None] = mapped_column(Integer)
+    key: Mapped[str] = mapped_column(String(10), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    owner_label: Mapped[str] = mapped_column(String(60), nullable=False)
+    offset_days: Mapped[int] = mapped_column(Integer, nullable=False)
+    due_date: Mapped[date] = mapped_column(Date, nullable=False)
+    is_critical: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    scope: Mapped[str] = mapped_column(String(10), default="centre", nullable=False)
+    depends_on: Mapped[list[str]] = mapped_column(JSONType, default=list, nullable=False)
+    proof_type: Mapped[str] = mapped_column(String(20), default="none", nullable=False)
+    proof_label: Mapped[str | None] = mapped_column(String(120))
+    skip_if_mode: Mapped[str | None] = mapped_column(String(60))
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    status: Mapped[str] = mapped_column(String(20), default="open", nullable=False)
+    done_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    done_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    done_late: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    proof_url: Mapped[str | None] = mapped_column(String(1000))
+    proof_count: Mapped[int | None] = mapped_column(Integer)
+    proof_count2: Mapped[int | None] = mapped_column(Integer)
+    status_reason: Mapped[str | None] = mapped_column(Text)  # waiver / closure / reopen reason
+    status_changed_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    notes: Mapped[str | None] = mapped_column(Text)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+
+    event: Mapped[Event] = relationship(lazy="joined")
+    centre: Mapped[Centre | None] = relationship(lazy="joined")
+    done_by: Mapped[User | None] = relationship(foreign_keys=[done_by_id], lazy="joined")
+    __mapper_args__ = {"version_id_col": version}
+
+    @property
+    def code(self) -> str:
+        return f"TSK-{self.id:06d}" if self.id else "TSK-new"
+
+    @property
+    def t_label(self) -> str:
+        return "T-0" if self.offset_days == 0 else (f"T{self.offset_days}" if self.offset_days < 0
+                                                     else f"T+{self.offset_days}")
+
+
+class TaskFlag(Base):
+    """Head Office audit finding on a task. Visible to the Centre Head."""
+    __tablename__ = "task_flags"
+    __table_args__ = (Index("ix_task_flags_task", "task_id"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("event_tasks.id", ondelete="CASCADE"), nullable=False)
+    flag_type: Mapped[str] = mapped_column(String(30), nullable=False)  # not_done_properly | other
+    comment: Mapped[str] = mapped_column(Text, nullable=False)
+    created_by_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now_utc, nullable=False)
+    centre_reply: Mapped[str | None] = mapped_column(Text)
+    replied_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+    replied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"))
+
+    created_by: Mapped[User] = relationship(foreign_keys=[created_by_id], lazy="joined")
+    task: Mapped[EventTask] = relationship(lazy="joined")

@@ -78,7 +78,7 @@ def cmd_seed_demo(url: str) -> None:
         today = today_ist()
         y, m = add_months(today.year, today.month, 1)
         for i, c in enumerate(centres[:4]):
-            d = today + timedelta(days=3 + i)
+            d = today + timedelta(days=12 + i)
             b, _ = ev.create_event(s, admin, category_id=cats["batch_launch"].id, centre_id=c.id, common=dict(
                 title=f"Civil Judge Foundation – {c.name}", event_date=d, start_time=time(10), end_time=time(12),
                 responsible_person=f"{c.name} Centre Head", expected_participation=40,

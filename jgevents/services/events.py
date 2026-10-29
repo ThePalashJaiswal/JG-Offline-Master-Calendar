@@ -181,16 +181,21 @@ def _validate_link(session: Session, category: EventCategory, centre_id: int | N
                    linked_event_id: int | None) -> None:
     if not linked_event_id:
         return
-    if not category.link_target_key:
+    targets = link_targets(category)
+    if not targets:
         raise ValidationError(f"{category.name} events cannot be linked to another event.")
     target = session.get(Event, linked_event_id)
-    if target is None or target.category.key != category.link_target_key:
+    if target is None or target.category.key not in targets:
         raise ValidationError("The linked event must be a "
-                              f"{category.link_target_key.replace('_', ' ')} event.")
+                              + " or ".join(t.replace("_", " ") for t in targets) + " event.")
     if target.centre_id != centre_id:
         raise ValidationError("The linked event must belong to the same centre.")
     if target.status in (Status.CANCELLED, Status.REJECTED):
         raise ValidationError("Cannot link to a cancelled or rejected event.")
+
+
+def link_targets(category: EventCategory) -> list[str]:
+    return [k.strip() for k in (category.link_target_key or "").split(",") if k.strip()]
 
 
 def _normalise_common(common: dict) -> dict:
@@ -225,7 +230,9 @@ def _refresh_plan(session: Session, ev: Event) -> None:
 def create_event(session: Session, actor: User, *, category_id: int, centre_id: int | None, common: dict,
                  details: dict | None = None, linked_event_id: int | None = None, submit: bool = False,
                  parent_event_id: int | None = None, is_proposed: bool = False,
-                 recurrence_rule_id: int | None = None, _national_parent: bool = False) -> tuple[Event, list[str]]:
+                 recurrence_rule_id: int | None = None, _national_parent: bool = False,
+                 late_reason: str | None = None) -> tuple[Event, list[str]]:
+    from jgevents.services import tasks as task_svc
     require_editor(actor)
     category = session.get(EventCategory, category_id)
     if category is None or not category.is_active:
@@ -245,13 +252,20 @@ def create_event(session: Session, actor: User, *, category_id: int, centre_id: 
     if errors:
         raise ValidationError(errors)
     _validate_link(session, category, centre_id, linked_event_id)
+    booked_late, late_reason = (False, None) if parent_event_id else task_svc.check_lead_time(
+        session, actor, category, common["event_date"], late_reason, national_parent=_national_parent)
     warnings = [] if _national_parent else _conflict_check(session, category, centre_id, common, None)
     ev = Event(category_id=category.id, centre_id=centre_id, details=details, linked_event_id=linked_event_id,
                parent_event_id=parent_event_id, is_national_parent=_national_parent, is_proposed=is_proposed,
                recurrence_rule_id=recurrence_rule_id, status=Status.DRAFT,
-               created_by_id=actor.id, updated_by_id=actor.id, **common)
+               created_by_id=actor.id, updated_by_id=actor.id, booked_late=booked_late, late_reason=late_reason,
+               late_approved_by_id=actor.id if booked_late else None, **common)
     session.add(ev)
     session.flush()
+    task_svc.generate_tasks(session, actor, ev)
+    if booked_late:
+        warnings.append(f"Booked inside the minimum lead time (Head Office exception: {late_reason}). "
+                        "Missed deadlines show as overdue.")
     for i, label in enumerate(category.default_checklist or []):
         session.add(ChecklistItem(event_id=ev.id, label=label, sort_order=i))
     _record(session, actor, ev, "created", None, Status.DRAFT)
@@ -266,7 +280,8 @@ def create_event(session: Session, actor: User, *, category_id: int, centre_id: 
 
 def update_event(session: Session, actor: User, event_id: int, expected_version: int | None, *,
                  common: dict, details: dict | None = None, linked_event_id: int | None = None,
-                 centre_id: int | None = None) -> tuple[Event, list[str]]:
+                 centre_id: int | None = None, late_reason: str | None = None) -> tuple[Event, list[str]]:
+    from jgevents.services import tasks as task_svc
     require_editor(actor)
     ev = _get_for_update(session, event_id)
     require_manage_event(actor, ev)
@@ -291,6 +306,16 @@ def update_event(session: Session, actor: User, event_id: int, expected_version:
         raise ValidationError(errors)
     _validate_link(session, category, new_centre, linked_event_id)
     warnings = [] if ev.is_national_parent else _conflict_check(session, category, new_centre, common, ev.id)
+    old_date = ev.event_date
+    new_date = common.get("event_date", old_date)
+    if new_date != old_date:
+        if ev.parent_event_id:
+            raise ValidationError("The date of a national mock is set by Head Office on the national event.")
+        late, reason = task_svc.check_lead_time(session, actor, category, new_date, late_reason,
+                                                national_parent=ev.is_national_parent)
+        if late:
+            ev.booked_late, ev.late_reason, ev.late_approved_by_id = True, reason, actor.id
+            warnings.append(f"Moved inside the minimum lead time (Head Office exception: {reason}).")
 
     changes = {}
     for k, v in common.items():
@@ -320,6 +345,15 @@ def update_event(session: Session, actor: User, event_id: int, expected_version:
         ev.submitted_at = now_utc()
         warnings.append("Approved event changed materially – it has been sent back to Head Office for re-approval.")
     _flush(session, ev)
+    if "event_date" in changes:
+        moved = task_svc.on_event_date_changed(session, actor, ev, old_date)
+        past = [k for k, _a, b in moved if b < today_ist()]
+        if past:
+            warnings.append("New deadlines already passed for " + ", ".join(past) + " – they show as overdue.")
+    if "centre_id" in changes:
+        task_svc.on_event_centre_changed(session, ev)
+    if "details" in changes:
+        task_svc.on_event_details_changed(session, actor, ev)
     if ev.is_national_parent and material & {"title", "event_date", "start_time", "end_time"}:
         _sync_children(session, actor, ev)
     audit.log(session, actor, "event.updated", "event", ev.id, f"{ev.code} updated ({', '.join(sorted(changes))})",
@@ -403,6 +437,12 @@ def transition(session: Session, actor: User, event_id: int, action: Action | st
         ev.submitted_at = now_utc()
     if action in (Action.START, Action.COMPLETE) and ev.event_date > today_ist():
         raise InvalidTransition("An event can be started or completed only on or after its date.")
+    from jgevents.services import tasks as task_svc
+    if action == Action.COMPLETE:
+        pending = task_svc.completion_blockers(session, ev)
+        if pending:
+            raise InvalidTransition("Finish the critical post-event task(s) first: "
+                                    + "; ".join(f"{t.key} {t.title} (due {t.due_date:%d-%m-%Y})" for t in pending))
     frm = ev.status
     ev.status = to
     ev.updated_by_id = actor.id
@@ -418,6 +458,7 @@ def transition(session: Session, actor: User, event_id: int, action: Action | st
         ev.cancel_reason = None
     _flush(session, ev)
     _record(session, actor, ev, action.value, frm, to, comment)
+    task_svc.on_event_status_changed(session, actor, ev, to)
     audit.log(session, actor, f"event.{action.value}", "event", ev.id,
               f"{ev.code} {ACTION_LABELS[action].lower()} ({frm} → {to})", centre_id=ev.centre_id,
               details={"comment": comment})
@@ -538,11 +579,12 @@ def linked_campaigns(session: Session, actor: User, batch_event_id: int) -> list
 
 
 def linkable_targets(session: Session, actor: User, category: EventCategory, centre_id: int) -> list[Event]:
-    if not category.link_target_key or centre_id is None:
+    targets = link_targets(category)
+    if not targets or centre_id is None:
         return []
     return list(session.scalars(
         select(Event).join(EventCategory, Event.category_id == EventCategory.id)
-        .where(EventCategory.key == category.link_target_key, Event.centre_id == centre_id,
+        .where(EventCategory.key.in_(targets), Event.centre_id == centre_id,
                Event.status.not_in([Status.CANCELLED, Status.REJECTED]),
                Event.event_date >= date.fromordinal(today_ist().toordinal() - 90))
         .order_by(Event.event_date)).unique())
@@ -560,13 +602,13 @@ def history(session: Session, actor: User, event_id: int) -> tuple[list[Approval
 # ---------------------------------------------------------------- national (parent/child) events
 
 def create_national_event(session: Session, actor: User, *, category_id: int, common: dict, details: dict | None,
-                          centre_ids: list[int]) -> tuple[Event, list[Event]]:
+                          centre_ids: list[int], late_reason: str | None = None) -> tuple[Event, list[Event]]:
     require_ho(actor)
     category = session.get(EventCategory, category_id)
     if category is None or not category.supports_national:
         raise ValidationError("This category does not support national events.")
     parent, _ = create_event(session, actor, category_id=category_id, centre_id=None, common=common,
-                             details=details, _national_parent=True)
+                             details=details, _national_parent=True, late_reason=late_reason)
     # A Head-Office-created national event is approved at source.
     frm = parent.status
     parent.status, parent.approved_at, parent.approved_by_id = Status.APPROVED, now_utc(), actor.id
@@ -600,6 +642,8 @@ def assign_centres(session: Session, actor: User, parent_id: int, centre_ids: li
         for i, label in enumerate(parent.category.default_checklist or []):
             session.add(ChecklistItem(event_id=child.id, label=label, sort_order=i))
         _record(session, actor, child, "created", None, Status.DRAFT, f"Assigned from national event {parent.code}")
+        from jgevents.services import tasks as task_svc
+        task_svc.generate_tasks(session, actor, child)
         audit.log(session, actor, "event.national_assigned", "event", child.id,
                   f"{child.code} created for {centre.name} from {parent.code}", centre_id=cid)
         created.append(child)
@@ -611,9 +655,14 @@ def _sync_children(session: Session, actor: User, parent: Event) -> None:
     for child in children(session, parent.id):
         if Status(child.status) in (Status.CANCELLED, Status.REJECTED, Status.COMPLETED):
             continue
+        old_date = child.event_date
         child.title, child.event_date = parent.title, parent.event_date
         child.start_time, child.end_time = parent.start_time, parent.end_time
         child.updated_by_id = actor.id
+        if old_date != child.event_date:
+            from jgevents.services import tasks as task_svc
+            session.flush()
+            task_svc.on_event_date_changed(session, actor, child, old_date)
         audit.log(session, actor, "event.synced_from_parent", "event", child.id,
                   f"{child.code} schedule synced from {parent.code}", centre_id=child.centre_id)
     session.flush()

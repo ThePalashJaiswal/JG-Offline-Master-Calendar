@@ -6,7 +6,7 @@ from datetime import date
 
 import streamlit as st
 
-from jgevents.db.models import Event, User
+from jgevents.db.models import Event, EventTask, User
 from jgevents.domain.constants import (
     LIVE_STATUSES,
     STATUS_ICONS,
@@ -16,6 +16,7 @@ from jgevents.domain.constants import (
     approval_status,
 )
 from jgevents.services import events as ev_svc
+from jgevents.services import tasks as task_svc
 from jgevents.services.permissions import is_ho
 from jgevents.utils.dates import fmt_date, fmt_time, month_grid, times_overlap, today_ist
 from ui.core import category_md, centre_label, esc, open_event, run, status_md, time_range
@@ -50,6 +51,16 @@ def chip_label(e: Event, clash: bool, show_centre: bool = True) -> str:
     elif st_ in (Status.DRAFT,):
         txt = f"_{txt}_"
     return f"{'⚠️' if clash else ''}{STATUS_ICONS[st_]} :{e.category.colour}[{txt}]"
+
+
+def task_chip(t: EventTask, show_centre: bool = True) -> str:
+    st_ = task_svc.state_of(t)
+    colour = "red" if st_ == "overdue" else ("gray" if st_ in ("done", "done_late", "waived", "not_needed") else "violet")
+    code = (t.centre.code if t.centre else "HO") if show_centre else ""
+    txt = esc(f"{t.key} {t.title[:22]}{'…' if len(t.title) > 22 else ''}")
+    if st_ in ("done", "done_late", "waived", "not_needed"):
+        txt = f"~~{txt}~~"
+    return f"{task_svc.STATE_ICONS[st_]} :{colour}[{code} {txt}]"
 
 
 def legend(categories) -> None:
@@ -93,10 +104,14 @@ def quick_view(event_id: int, user: User) -> None:
         open_event(e.id)
 
 
-def month_view(events: list[Event], year: int, month: int, user: User, key: str, show_centre: bool = True) -> None:
+def month_view(events: list[Event], year: int, month: int, user: User, key: str, show_centre: bool = True,
+               tasks: list[EventTask] | None = None) -> None:
     by_day = defaultdict(list)
     for e in events:
         by_day[e.event_date].append(e)
+    tasks_by_day = defaultdict(list)
+    for t in tasks or []:
+        tasks_by_day[t.due_date].append(t)
     clashes = conflict_ids(events)
     today = today_ist()
     head = st.columns(7, gap="small")
@@ -111,17 +126,28 @@ def month_view(events: list[Event], year: int, month: int, user: User, key: str,
                     if d is None:
                         continue
                     day_events = by_day.get(d, [])
+                    day_tasks = tasks_by_day.get(d, [])
+                    n = len(day_events) + len(day_tasks)
                     style = "background:#1c83e1;color:white;border-radius:10px;padding:0 6px" if d == today else ""
-                    count = f" <span style='opacity:.6;font-size:.8em'>· {len(day_events)}</span>" if day_events else ""
+                    count = f" <span style='opacity:.6;font-size:.8em'>· {n}</span>" if n else ""
                     st.markdown(f"<span style='font-weight:700;{style}'>{d.day}</span>{count}",
                                 unsafe_allow_html=True)
+                    shown = 0
                     for e in day_events[:MAX_PER_CELL]:
+                        shown += 1
                         if st.button(chip_label(e, e.id in clashes, show_centre), key=f"{key}_{e.id}",
                                      type="tertiary", help=f"{centre_label(e)} · {e.title} · {time_range(e)} · "
                                                            f"{STATUS_LABELS[Status(e.status)]}"):
                             quick_view(e.id, user)
-                    if len(day_events) > MAX_PER_CELL:
-                        st.button(f"+{len(day_events) - MAX_PER_CELL} more", key=f"{key}_more_{d}",
+                    for t in day_tasks[:max(MAX_PER_CELL - shown, 0)]:
+                        shown += 1
+                        if st.button(task_chip(t, show_centre), key=f"{key}_t{t.id}", type="tertiary",
+                                     help=f"Task for {t.event.title} · {t.owner_label} · "
+                                          f"{task_svc.STATE_LABELS[task_svc.state_of(t)]}"):
+                            from ui.components.tasks_ui import task_dialog
+                            task_dialog(t.id, user)
+                    if n > shown:
+                        st.button(f"+{n - shown} more", key=f"{key}_more_{d}",
                                   type="tertiary", on_click=_to_agenda, args=(key, d))
 
 
@@ -130,10 +156,15 @@ def _to_agenda(key: str, d: date) -> None:
     st.session_state[f"{key}_day"] = d
 
 
-def agenda_view(events: list[Event], day: date, user: User, key: str) -> None:
+def agenda_view(events: list[Event], day: date, user: User, key: str, tasks: list[EventTask] | None = None) -> None:
     todays = [e for e in events if e.event_date == day]
     clashes = conflict_ids(todays)
     st.subheader(f"{day.strftime('%A')}, {fmt_date(day)}")
+    day_tasks = [t for t in tasks or [] if t.due_date == day]
+    if day_tasks:
+        st.markdown("**Preparation tasks due**")
+        from ui.components.tasks_ui import task_table
+        task_table(day_tasks, user, key=f"{key}_ag_tasks", hide=("Due", "T"))
     if not todays:
         st.info("No events on this day.", icon=":material/event_available:")
         return
@@ -153,21 +184,29 @@ def agenda_view(events: list[Event], day: date, user: User, key: str) -> None:
                     quick_view(e.id, user)
 
 
-def list_view(events: list[Event], user: User, key: str) -> None:
-    if not events:
-        st.info("No events for these filters.", icon=":material/event_busy:")
+def list_view(events: list[Event], user: User, key: str, tasks: list[EventTask] | None = None) -> None:
+    tasks = tasks or []
+    if not events and not tasks:
+        st.info("Nothing for these filters.", icon=":material/event_busy:")
         return
     clashes = conflict_ids(events)
-    current = None
-    for e in events:
-        if e.event_date != current:
-            current = e.event_date
-            st.markdown(f"#### {e.event_date.strftime('%a')} {fmt_date(e.event_date)}")
-        c1, c2, c3, c4 = st.columns([1.1, 1.3, 4, 1.6], vertical_alignment="center")
-        c1.markdown(time_range(e))
-        c2.markdown(f"**{centre_label(e)}**")
-        c3.markdown(f"{'⚠️ ' if e.id in clashes else ''}{category_md(e)} · {esc(e.title)}")
-        if c4.button(f"{STATUS_ICONS[Status(e.status)]} {approval_status(e.status)}", key=f"{key}_li_{e.id}",
-                     width="stretch"):
-            quick_view(e.id, user)
+    days = sorted({e.event_date for e in events} | {t.due_date for t in tasks})
+    for d in days:
+        st.markdown(f"#### {d.strftime('%a')} {fmt_date(d)}")
+        for e in [x for x in events if x.event_date == d]:
+            c1, c2, c3, c4 = st.columns([1.1, 1.3, 4, 1.6], vertical_alignment="center")
+            c1.markdown(time_range(e))
+            c2.markdown(f"**{centre_label(e)}**")
+            c3.markdown(f"{'⚠️ ' if e.id in clashes else ''}{category_md(e)} · {esc(e.title)}")
+            if c4.button(f"{STATUS_ICONS[Status(e.status)]} {approval_status(e.status)}", key=f"{key}_li_{e.id}",
+                         width="stretch"):
+                quick_view(e.id, user)
+        for t in [x for x in tasks if x.due_date == d]:
+            c1, c2, c3, c4 = st.columns([1.1, 1.3, 4, 1.6], vertical_alignment="center")
+            c1.markdown(":violet[task]")
+            c2.markdown(f"**{t.centre.name if t.centre else 'Head Office'}**")
+            c3.markdown(f"{task_svc.STATE_ICONS[task_svc.state_of(t)]} {t.key} {esc(t.title)} · for {esc(t.event.title)}")
+            if c4.button(task_svc.STATE_LABELS[task_svc.state_of(t)], key=f"{key}_lt_{t.id}", width="stretch"):
+                from ui.components.tasks_ui import task_dialog
+                task_dialog(t.id, user)
 

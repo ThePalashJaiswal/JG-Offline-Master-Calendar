@@ -38,9 +38,9 @@ def _view(uid, view, **state):
 
 
 HO_VIEWS = ["ho_home", "calendar", "planning", "events", "new", "approvals", "national", "event", "reports",
-            "centres", "users", "config", "audit"]
-CH_VIEWS = ["centre_home", "calendar", "planning", "events", "new", "event", "reports"]
-VIEWER_VIEWS = ["ho_home", "calendar", "events", "event", "reports"]
+            "centres", "users", "config", "audit", "tasks", "readiness", "playbooks"]
+CH_VIEWS = ["centre_home", "calendar", "planning", "events", "new", "event", "reports", "tasks"]
+VIEWER_VIEWS = ["ho_home", "calendar", "events", "event", "reports", "tasks", "readiness"]
 
 
 @pytest.mark.parametrize("username,views", [("admin", HO_VIEWS), ("ho.admin", HO_VIEWS),
@@ -120,6 +120,10 @@ def test_ui_create_submit_and_approve_flow(demo):
     at.selectbox(key=f"{p}_d_programme").select("Foundation")
     next(b for b in at.button if b.label == "Save draft").click().run()
     assert not at.exception, at.exception
+    # v2: the preparation schedule is shown before saving
+    assert any("Preparation schedule" in m.value for m in at.markdown)
+    next(b for b in at.button if b.label == "Confirm and save").click().run()
+    assert not at.exception, at.exception
     assert not at.error, [e.value for e in at.error]
     with session_scope(os.environ["DATABASE_URL"]) as s:
         ev = s.scalar(select(Event).where(Event.title == "UI batch launch"))
@@ -151,3 +155,62 @@ def test_ui_create_submit_and_approve_flow(demo):
     assert not ho.exception and not ho.error, [e.value for e in ho.error]
     with session_scope(os.environ["DATABASE_URL"]) as s:
         assert s.get(Event, eid).status == "approved"
+
+
+
+def test_ui_readiness_pages_show_demo_tasks(demo):
+    """Event page shows a Readiness tab with tasks; calendar shows task chips; board lists events."""
+    users, _ = demo
+    with session_scope(os.environ["DATABASE_URL"]) as s:
+        launch = s.scalar(select(Event).where(Event.title.like("Civil Judge Foundation%")))
+        eid = launch.id
+    at = _view(users["ch.del"] if "Delhi" in launch.title else users["admin"], "event", event_id=eid)
+    assert not at.exception, at.exception
+    assert any(t.label.startswith("Readiness") for t in at.tabs)
+    ho = _view(users["ho.admin"], "readiness")
+    assert not ho.exception, ho.exception
+    assert any("Events with a playbook" in b.label for b in ho.button)
+    ho.button(key="rb_m_events").click().run()
+    assert not ho.exception
+    cal = _view(users["ho.admin"], "calendar")
+    assert not cal.exception
+    assert any("task(s)" in m.value for m in cal.markdown)
+    pb = _view(users["admin"], "playbooks")
+    assert not pb.exception and any("minimum lead time" in m.value for m in pb.markdown)
+
+
+def test_ui_centre_head_cannot_book_launch_inside_lead_time(demo):
+    from datetime import date, time, timedelta
+
+    from jgevents.utils.dates import today_ist
+    users, _ = demo
+    with session_scope(os.environ["DATABASE_URL"]) as s:
+        from jgevents.db.models import Centre
+        cid = s.scalar(select(Centre).where(Centre.code == "BPL")).id
+    at = _view(users["ch.bpl"], "new")
+    p = f"new_batch_launch_{cid}"
+    d = today_ist() + timedelta(days=3)
+    at.text_input(key=f"{p}_title").input("Too soon")
+    at.date_input(key=f"{p}_date").set_value(d)
+    at.time_input(key=f"{p}_start").set_value(time(9, 0))
+    next(b for b in at.button if b.label == "Save draft").click().run()
+    assert not at.exception
+    assert any("at least 10 days" in e.value for e in at.error)
+    assert not any(b.label == "Confirm and save" for b in at.button)
+    _ = date
+
+
+def test_ui_centre_head_marks_task_done_from_event_page(demo):
+    users, _ = demo
+    with session_scope(os.environ["DATABASE_URL"]) as s:
+        launch = s.scalar(select(Event).where(Event.title == "Civil Judge Foundation – Delhi"))
+        eid = launch.id
+    at = _view(users["ch.del"], "event", event_id=eid)
+    assert not at.exception, at.exception
+    next(b for b in at.button if b.label == "Mark done").click().run()  # BL1 has no proof requirement
+    assert not at.exception, at.exception
+    assert not at.error, [e.value for e in at.error]
+    from jgevents.db.models import EventTask
+    with session_scope(os.environ["DATABASE_URL"]) as s:
+        t = s.scalar(select(EventTask).where(EventTask.event_id == eid, EventTask.key == "BL1"))
+        assert t.status == "done" and t.done_by_id == users["ch.del"]

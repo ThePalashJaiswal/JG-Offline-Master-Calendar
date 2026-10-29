@@ -7,7 +7,15 @@ from datetime import time
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from jgevents.db.models import AppSetting, CategoryRequirement, Centre, EventCategory, RecurrenceRule
+from jgevents.db.models import (
+    AppSetting,
+    CategoryRequirement,
+    Centre,
+    EventCategory,
+    Playbook,
+    PlaybookTask,
+    RecurrenceRule,
+)
 from jgevents.domain.constants import Requirement
 
 CENTRES = [
@@ -41,13 +49,12 @@ CATEGORIES: list[dict] = [
             {"key": "promo_deadline", "label": "Promotional activity deadline", "type": "date",
              "before_event": True},
         ],
-        "default_checklist": ["Classroom & AV ready", "Faculty confirmed", "Study material ready",
-                              "Promotion completed", "WhatsApp campaign scheduled", "Registration desk set up"],
+        "default_checklist": [],
     },
     {
         "key": "whatsapp_campaign", "name": "Bulk WhatsApp Campaign", "icon": "💬", "colour": "green",
         "group": "marketing", "sort_order": 20, "occupies_slot": False, "conflict_policy": "none",
-        "link_target_key": "batch_launch",
+        "link_target_key": "batch_launch,open_mock",
         "description": "Planned bulk WhatsApp communication. Tracked manually – the app does not send messages.",
         "common_overrides": {
             "title": {"label": "Campaign / communication title"},
@@ -111,8 +118,7 @@ CATEGORIES: list[dict] = [
             {"key": "registrations", "label": "Registrations received", "type": "int", "phase": "execution"},
             {"key": "scholarships_awarded", "label": "Scholarships awarded", "type": "int", "phase": "execution"},
         ],
-        "default_checklist": ["Paper set & reviewed", "Registration form live", "Promotion started",
-                              "Invigilators assigned", "Results published"],
+        "default_checklist": [],
     },
     {
         "key": "pmi", "name": "PMI – Pre-Mains Interview Test", "icon": "⚖️", "colour": "red",
@@ -167,13 +173,48 @@ CATEGORIES: list[dict] = [
             {"key": "promo_start", "label": "Promotion start date", "type": "date", "before_event": True},
             {"key": "registrations", "label": "Registrations received", "type": "int", "phase": "execution"},
         ],
-        "default_checklist": ["Registrations open", "Promotion started", "Hall & invigilation arranged",
-                              "Papers / login received", "Results communicated"],
+        "default_checklist": [],
     },
 ]
 
 # Business-rule defaults. These are ASSUMPTIONS to be confirmed by Head Office;
 # all are editable in Admin → Categories & rules.
+# v2 – approved pre-event playbooks (spec signed off 29-10-2026).
+# Tuple: key, title, offset_days, owner, critical, scope, depends_on, proof_type, proof_label, skip_if_mode
+PLAYBOOKS: dict[str, list[tuple]] = {
+    "batch_launch": [
+        ("BL1", "Batch details final: subject, faculty, timing, fee", -10, "Centre Head", True, "centre", [],
+         "none", None, None),
+        ("BL2", "Admission link / landing page live and checked", -7, "Marketing", True, "centre", ["BL1"],
+         "url", "Admission link", None),
+        ("BL3", "Counselling calls start", -6, "Counselling", True, "centre", ["BL2"], "count", "Calls made", None),
+        ("BL4", "Bulk WhatsApp sent", -2, "Centre Head", True, "centre", ["BL2"], "whatsapp_auto",
+         "Linked WhatsApp campaign completed", None),
+        ("BL5", "Follow-up calls to no-shows", 2, "Counselling", False, "centre", [], "count", "Calls made", None),
+    ],
+    "scholarship_test": [
+        ("ST1", "Cold calling starts", -5, "Counselling", True, "centre", [], "count", "Calls made", None),
+        ("ST2", "Question paper received at centre", -2, "Centre Head", True, "centre", [], "none", None, None),
+        ("ST3", "Centre ready: seats and printed papers for every registered student", -1, "Centre Head", True,
+         "centre", ["ST2"], "seats", "Seats arranged / registrations", None),
+        ("ST4", "Scholarship list recorded", 1, "Centre Head", True, "centre", [], "count",
+         "Scholarships awarded", None),
+    ],
+    "open_mock": [
+        ("H1", "Papers dispatched to centres / online test link ready", -3, "HO Academic", True, "national", [],
+         "none", None, None),
+        ("H2", "All-India results published", 7, "HO Academic", True, "national", [], "url", "Results link", None),
+        ("C1", "Registration record set up (LeadSquared page or centre sheet)", -14, "Centre Head", True, "centre",
+         [], "url", "Registration page / sheet link", None),
+        ("C2", "Cold calling starts", -10, "Counselling", True, "centre", ["C1"], "count", "Calls made", None),
+        ("C3", "Bulk WhatsApp sent", -3, "Centre Head", True, "centre", ["C1"], "whatsapp_auto",
+         "Linked WhatsApp campaign completed", None),
+        ("C4", "Centre ready: seats \u2265 registrations", -1, "Centre Head", True, "centre", ["H1"], "seats",
+         "Seats arranged / registrations", "Online"),
+        ("C5", "Follow-up calls to participants", 3, "Counselling", False, "centre", [], "count", "Calls made", None),
+    ],
+}
+
 DEFAULT_REQUIREMENTS = {"scholarship_test": (Requirement.MANDATORY, 1)}
 DEFAULT_SETTINGS = {
     "planning_deadline_day": 25,          # plans due by the 25th of the previous month
@@ -212,7 +253,25 @@ def seed_reference_data(session: Session) -> None:
             title_template="{centre} Scholarship Test – {month_name} {year}", centre_ids=None,
             defaults={"venue": "Centre classroom"}, is_active=True,
         ))
+    seed_playbooks(session)
     for key, value in DEFAULT_SETTINGS.items():
         if session.get(AppSetting, key) is None:
             session.add(AppSetting(key=key, value=value))
+    session.flush()
+
+
+def seed_playbooks(session: Session) -> None:
+    """Create version 1 of each approved playbook if the category has none yet."""
+    cats = {c.key: c for c in session.scalars(select(EventCategory))}
+    for key, rows in PLAYBOOKS.items():
+        cat = cats.get(key)
+        if cat is None or session.scalar(select(Playbook.id).where(Playbook.category_id == cat.id).limit(1)):
+            continue
+        pb = Playbook(category_id=cat.id, version=1, is_active=True, notes="Approved playbook (v2 spec)")
+        session.add(pb)
+        session.flush()
+        for i, (tkey, title, off, owner, crit, scope, deps, proof, plabel, skip) in enumerate(rows):
+            session.add(PlaybookTask(playbook_id=pb.id, key=tkey, title=title, offset_days=off, owner_label=owner,
+                                     is_critical=crit, scope=scope, depends_on=deps, proof_type=proof,
+                                     proof_label=plabel, skip_if_mode=skip, sort_order=i))
     session.flush()

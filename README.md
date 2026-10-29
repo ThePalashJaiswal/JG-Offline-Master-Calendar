@@ -21,6 +21,7 @@ execution on one consolidated calendar for any month.
 | HO dashboard | Filterable metrics (every tile drills into the records), events by category/centre, planning status by centre, next 7 days, completion rate |
 | Reports | 9 reports to Excel/CSV, printable monthly overview (HTML → print/PDF); all exports respect user access and filters |
 | Admin | Centres, users & roles, requirements per category/centre, deadlines, recurrence rules, category editor, audit log |
+| **v2 – Pre-event readiness** | Playbooks for Batch Launch, Scholarship Test and All India Open Mock generate dated, owned tasks per event; lead-time enforcement; proof-based ticking; readiness status; Readiness board; audit flags; task calendar; playbook versioning. See [docs/V2_READINESS.md](docs/V2_READINESS.md) |
 | Security | bcrypt passwords, lockout, forced temporary-password change, server-side authorization on every action, optimistic locking against lost updates, full audit trail |
 
 ## Quick start (local, 2 minutes)

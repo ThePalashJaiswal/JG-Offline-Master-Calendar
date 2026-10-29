@@ -17,6 +17,7 @@ from ui.views import (  # noqa: E402
     event_view,
     events_views,
     planning_view,
+    readiness_views,
     reports_view,
 )
 
@@ -89,20 +90,28 @@ P = {
     "config": st.Page(admin_views.configuration, title="Rules & categories", icon=":material/tune:", url_path="config"),
     "audit": st.Page(admin_views.audit_log, title="Audit log", icon=":material/history:", url_path="audit"),
     "account": st.Page(account, title="My account", icon=":material/person:", url_path="account"),
+    "tasks": st.Page(readiness_views.tasks_page, title="Preparation tasks", icon=":material/task_alt:",
+                     url_path="tasks"),
+    "readiness": st.Page(readiness_views.readiness_board, title="Readiness board", icon=":material/fact_check:",
+                         url_path="readiness"),
+    "playbooks": st.Page(readiness_views.playbooks_page, title="Playbooks", icon=":material/checklist:",
+                         url_path="playbooks"),
 }
 st.session_state["_pages"] = P
 
 # Pages a role cannot use are never registered, so their URLs do not resolve.
 # (The services enforce the same rules independently.)
 if role == Role.CENTRE_HEAD:
-    nav = {"Plan & track": [P["home"], P["planning"], P["new"], P["calendar"], P["events"], P["event"], P["reports"]],
+    nav = {"Plan & track": [P["home"], P["tasks"], P["planning"], P["new"], P["calendar"], P["events"], P["event"],
+                            P["reports"]],
            "": [P["account"]]}
 elif role == Role.VIEWER:
-    nav = {"Overview": [P["home"], P["calendar"], P["events"], P["event"], P["reports"]], "": [P["account"]]}
+    nav = {"Overview": [P["home"], P["readiness"], P["tasks"], P["calendar"], P["events"], P["event"], P["reports"]],
+           "": [P["account"]]}
 else:
-    nav = {"Head Office": [P["home"], P["approvals"], P["calendar"], P["planning"], P["events"], P["event"],
-                           P["national"], P["new"], P["reports"]],
-           "Administration": [P["centres"], P["users"], P["config"], P["audit"]], "": [P["account"]]}
+    nav = {"Head Office": [P["home"], P["readiness"], P["approvals"], P["tasks"], P["calendar"], P["planning"],
+                           P["events"], P["event"], P["national"], P["new"], P["reports"]],
+           "Administration": [P["centres"], P["users"], P["playbooks"], P["config"], P["audit"]], "": [P["account"]]}
 
 page = st.navigation(nav)
 

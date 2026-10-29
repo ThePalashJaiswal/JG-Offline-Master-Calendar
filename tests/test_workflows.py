@@ -36,7 +36,10 @@ def test_draft_is_lenient_submit_is_strict(ctx):
         e, _ = ev.create_event(s, ctx.ch_bpl, category_id=ctx.cats["batch_launch"].id, centre_id=ctx.bpl.id,
                                common=dict(title="Half-planned", event_date=next_month_date()))
         assert e.status == Status.DRAFT
-        assert s.scalar(select(ChecklistItem).where(ChecklistItem.event_id == e.id)) is not None
+        # v2: playbook tasks replace the old free-text checklist for batch launches
+        assert s.scalar(select(ChecklistItem).where(ChecklistItem.event_id == e.id)) is None
+        from jgevents.db.models import EventTask
+        assert s.scalar(select(EventTask).where(EventTask.event_id == e.id)) is not None
         with pytest.raises(ValidationError) as exc:
             ev.transition(s, ctx.ch_bpl, e.id, "submit")
         msg = str(exc.value)

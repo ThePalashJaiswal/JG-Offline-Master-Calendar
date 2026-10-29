@@ -10,6 +10,7 @@ from jgevents.services import config_service, directory, reports
 from jgevents.services import events as ev_svc
 from jgevents.services.permissions import is_ho
 from jgevents.utils.dates import fmt_date, today_ist
+from ui.components.tasks_ui import creation_gate
 from ui.components.widgets import event_filters, event_form, events_table, pick_category
 from ui.core import category_md, db, esc, flash, me, open_event, page_header, run, time_range
 
@@ -59,12 +60,13 @@ def new_event() -> None:
     if cat.supports_national and is_ho(user):
         st.info("For a network-wide All India Open Mock, use **National events** so every centre gets its own "
                 "participation record linked to one parent.")
-    res = event_form(f"new_{cat.key}_{cid}", user, cat, cid, default_date=today_ist() + timedelta(days=7))
+    res = event_form(f"new_{cat.key}_{cid}", user, cat, cid, default_date=today_ist() + timedelta(days=14))
+    res, late_reason = creation_gate(f"new_{cat.key}_{cid}_gate", user, cat, res)
     if res:
         def do(s):
             e, warnings = ev_svc.create_event(s, user, category_id=cat.id, centre_id=cid, common=res["common"],
                                               details=res["details"], linked_event_id=res["linked"],
-                                              submit=res["action"] == "submit")
+                                              submit=res["action"] == "submit", late_reason=late_reason)
             for w in warnings:
                 flash("warning", w)
             return e.id
@@ -146,11 +148,13 @@ def national() -> None:
                                 format_func=lambda i: next(c.name for c in centres if c.id == i), key="nat_centres")
         st.caption("Head Office sets the common details. Each centre then completes its own venue, expected "
                    "participants and participation plan, and submits it with its monthly plan.")
-        res = event_form(f"nat_new_{cat.key}", user, cat, None, default_date=today_ist() + timedelta(days=20))
+        res = event_form(f"nat_new_{cat.key}", user, cat, None, default_date=today_ist() + timedelta(days=21))
+        res, late_reason = creation_gate(f"nat_new_{cat.key}_gate", user, cat, res, national_parent=True)
         if res:
             def do(s):
                 p, kids = ev_svc.create_national_event(s, user, category_id=cat.id, common=res["common"],
-                                                       details=res["details"], centre_ids=chosen)
+                                                       details=res["details"], centre_ids=chosen,
+                                                       late_reason=late_reason)
                 return p.id
             pid = run(do, "National event created and assigned to centres.", rerun=False)
             if pid:

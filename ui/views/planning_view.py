@@ -9,6 +9,7 @@ from jgevents.services import events as ev_svc
 from jgevents.services.permissions import can_manage_centre, is_ho
 from jgevents.utils.dates import add_months, fmt_date, fmt_dt, month_bounds, month_label, today_ist
 from ui.components.calendar import month_view
+from ui.components.tasks_ui import creation_gate
 from ui.components.widgets import event_form, events_table, pick_category
 from ui.core import db, flash, me, month_picker, page_header, run
 
@@ -96,9 +97,11 @@ def render() -> None:
             if cat:
                 start, end = month_bounds(y, m)
                 default = max(start, today_ist()) if start <= today_ist() <= end else start
-                res = event_form(f"plan_new_{cat.key}_{cid}_{y}_{m}", user, cat, cid, default_date=default)
+                fkey = f"plan_new_{cat.key}_{cid}_{y}_{m}"
+                res = event_form(fkey, user, cat, cid, default_date=default)
+                res, late_reason = creation_gate(f"{fkey}_gate", user, cat, res)
                 if res:
-                    _create(user, cat, cid, res)
+                    _create(user, cat, cid, res, late_reason)
         with st.expander("🔁 Recurring events (review before adding)"):
             with db() as s:
                 props = recurrence.proposals(s, user, y, m, centre_ids=[cid])
@@ -146,11 +149,11 @@ def render() -> None:
                          hide_index=True, width="stretch")
 
 
-def _create(user, cat, centre_id, res) -> None:
+def _create(user, cat, centre_id, res, late_reason=None) -> None:
     def do(s):
         e, warnings = ev_svc.create_event(s, user, category_id=cat.id, centre_id=centre_id, common=res["common"],
                                           details=res["details"], linked_event_id=res["linked"],
-                                          submit=res["action"] == "submit")
+                                          submit=res["action"] == "submit", late_reason=late_reason)
         for w in warnings:
             flash("warning", w)
         return e

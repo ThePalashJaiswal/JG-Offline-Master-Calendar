@@ -31,6 +31,7 @@ from jgevents.utils.dates import (
     month_grid,
     month_label,
     now_utc,
+    to_ist,
     today_ist,
 )
 
@@ -44,6 +45,7 @@ REPORTS = {
     "history": "Event history (approvals & changes)",
     "participation": "Scholarship test & mock participation",
     "batch_whatsapp": "Batch launches & WhatsApp activity",
+    "readiness": "Pre-event readiness & task compliance",
 }
 
 
@@ -203,7 +205,79 @@ def build_report(session: Session, actor: User, key: str, f: EventFilter, year: 
                 "Responses": sum((c.details or {}).get("responses") or 0 for c in linked),
             })
         return {"Batch launches": pd.DataFrame(rows), "WhatsApp campaigns": events_df(camps, True)}
+    if key == "readiness":
+        return readiness_report(session, actor, f, year, month)
     raise ValueError(f"Unknown report {key}")
+
+
+def readiness_report(session: Session, actor: User, f: EventFilter, year: int, month: int) -> dict[str, pd.DataFrame]:
+    """Operational compliance (were tasks done on time?) beside outcomes (expected vs actual turnout).
+    Shown side by side for comparison only; no causal claim is made."""
+    from jgevents.services import tasks as task_svc
+    start, end = month_bounds(year, month)
+    events = [e for e in ev_svc.list_events(session, actor, EventFilter(
+        date_from=start, date_to=end, centre_ids=f.centre_ids, category_ids=f.category_ids))
+        if task_svc.event_tasks(session, e.id)]
+    all_tasks = [t for e in events for t in task_svc.event_tasks(session, e.id)]
+    dep = task_svc.dependency_map(session, all_tasks)
+    today = today_ist()
+    task_rows, ev_rows = [], []
+    by_centre: dict[str, dict] = defaultdict(lambda: dict(due=0, on_time=0, late=0, overdue=0, waived=0,
+                                                          crit_late_days=[], flags=0, events=0, all_crit_on_time=0))
+    flags = {fl.task_id for fl in task_svc.list_flags(session, actor, open_only=False,
+                                                       task_ids=[t.id for t in all_tasks])}
+    for e in events:
+        ts = [t for t in all_tasks if t.event_id == e.id]
+        r = task_svc.readiness(session, e, ts, dep)
+        crit_pre = [t for t in ts if t.is_critical and t.offset_days <= 0]
+        crit_on_time = all(t.status in ("waived", "not_needed") or (t.status == "done" and not t.done_late)
+                           for t in crit_pre)
+        c = by_centre[e.centre.name if e.centre else "National"]
+        c["events"] += 1
+        c["all_crit_on_time"] += crit_on_time and all(t.due_date < today or t.status != "open" for t in crit_pre)
+        regs = next((t.proof_count2 for t in ts if t.proof_type == "seats" and t.proof_count2 is not None), None)
+        ev_rows.append({
+            "Event ID": e.code, "Centre": e.centre.name if e.centre else "National", "Category": e.category.name,
+            "Title": e.title, "Date": fmt_date(e.event_date), "Status": STATUS_LABELS[Status(e.status)],
+            "Readiness": r.label, "Reasons": " | ".join(r.reasons), "Tasks": r.total, "Done": r.done,
+            "Done late": r.done_late, "Waived": r.waived, "Overdue": r.overdue,
+            "All critical prep on time": "Yes" if crit_on_time else "No", "Booked late": "Yes" if e.booked_late else "",
+            "Expected": e.expected_participation, "Registrations": regs, "Actual": e.actual_participation,
+            "Turnout % of expected": round(100 * e.actual_participation / e.expected_participation)
+            if e.expected_participation and e.actual_participation is not None else None,
+        })
+        for t in ts:
+            st = task_svc.state_of(t, dep)
+            if st not in ("closed", "not_needed") and t.due_date <= today:
+                c["due"] += 1
+            c["on_time"] += st == "done"
+            c["late"] += st == "done_late"
+            c["overdue"] += st == "overdue"
+            c["waived"] += st == "waived"
+            c["flags"] += t.id in flags
+            if t.is_critical and t.status == "done" and t.done_late and t.done_at:
+                c["crit_late_days"].append((to_ist(t.done_at).date() - t.due_date).days)
+            task_rows.append({
+                "Task": t.code, "Event ID": e.code, "Centre": e.centre.name if e.centre else "National",
+                "Event": e.title, "Key": t.key, "Task title": t.title, "T": task_svc.t_label(t.offset_days),
+                "Due": fmt_date(t.due_date), "Owner": t.owner_label, "Critical": "Yes" if t.is_critical else "",
+                "State": task_svc.STATE_LABELS[st], "Done (IST)": fmt_dt(t.done_at),
+                "Done by": t.done_by.full_name if t.done_by else "", "Proof link": t.proof_url or "",
+                "Proof count": t.proof_count, "Registrations": t.proof_count2, "Reason / note": t.status_reason or "",
+                "Audit flag": "Yes" if t.id in flags else "",
+            })
+    centre_rows = []
+    for name, c in sorted(by_centre.items()):
+        finished = c["on_time"] + c["late"]
+        centre_rows.append({
+            "Centre": name, "Events": c["events"], "Tasks due so far": c["due"], "Done on time": c["on_time"],
+            "Done late": c["late"], "Overdue now": c["overdue"], "Waived": c["waived"],
+            "On-time rate %": round(100 * c["on_time"] / finished) if finished else None,
+            "Avg days late (critical)": round(sum(c["crit_late_days"]) / len(c["crit_late_days"]), 1)
+            if c["crit_late_days"] else None,
+            "Audit flags": c["flags"],
+        })
+    return {"By centre": pd.DataFrame(centre_rows), "Events": pd.DataFrame(ev_rows), "Tasks": pd.DataFrame(task_rows)}
 
 
 def to_excel(sheets: dict[str, pd.DataFrame]) -> bytes:

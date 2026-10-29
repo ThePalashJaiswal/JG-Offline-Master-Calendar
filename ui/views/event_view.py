@@ -14,9 +14,11 @@ from jgevents.domain.constants import (
 from jgevents.domain.schema import common_field_config, display_detail
 from jgevents.services import directory
 from jgevents.services import events as ev_svc
+from jgevents.services import tasks as task_svc
 from jgevents.services.errors import ServiceError
 from jgevents.services.permissions import can_manage_centre, is_ho
 from jgevents.utils.dates import fmt_date, fmt_dt
+from ui.components.tasks_ui import date_change_gate, readiness_md, task_panel, task_table
 from ui.components.widgets import event_form, events_table, execution_form
 from ui.core import category_md, centre_label, db, esc, flash, me, open_event, page_header, run, status_md, time_range
 
@@ -43,7 +45,13 @@ def render() -> None:
             refs = ev_svc.references(s, user, eid)
             approvals, logs = ev_svc.history(s, user, eid)
             kids = ev_svc.visible_children(s, user, eid) if e.is_national_parent else []
-            camps = ev_svc.linked_campaigns(s, user, eid) if e.category.key == "batch_launch" else []
+            camps = ev_svc.linked_campaigns(s, user, eid) if e.category.key in ("batch_launch", "open_mock") else []
+            ev_tasks = task_svc.event_tasks(s, eid)
+            dep = task_svc.dependency_map(s, ev_tasks)
+            ready = task_svc.readiness(s, e, ev_tasks, dep)
+            has_pb = task_svc.has_playbook(s, e.category_id)
+            for t in ev_tasks:
+                _ = t.event, t.centre
             parent = s.get(type(e), e.parent_event_id) if e.parent_event_id else None
             linked = s.get(type(e), e.linked_event_id) if e.linked_event_id else None
             for x in [*kids, *camps]:
@@ -57,7 +65,11 @@ def render() -> None:
     page_header(f"{e.category.icon} {e.title}")
     st.markdown(f"{status_md(e.status)} &nbsp; {category_md(e)} &nbsp; **{centre_label(e)}** &nbsp; `{e.code}`"
                 + (" &nbsp; :orange-badge[Changed after approval]" if e.changed_after_approval else "")
-                + (" &nbsp; :violet-badge[Proposed from recurring rule]" if e.is_proposed else ""))
+                + (" &nbsp; :violet-badge[Proposed from recurring rule]" if e.is_proposed else "")
+                + (f" &nbsp; {readiness_md(ready)}" if ready.status else "")
+                + (" &nbsp; :red-badge[Booked late]" if e.booked_late else ""))
+    if e.booked_late and e.late_reason:
+        st.caption(f"Head Office exception for booking inside the minimum lead time: {e.late_reason}")
     flags = ev_svc.risk_flags(e)
     if flags:
         st.warning(" · ".join(flags))
@@ -70,8 +82,23 @@ def render() -> None:
 
     manage = (is_ho(user) if e.is_national_parent else can_manage_centre(user, e.centre_id))
     editable = manage and (Status(e.status) in CENTRE_EDITABLE or (is_ho(user) and e.status == Status.IN_PROGRESS))
-    tabs = st.tabs(["Overview", "Edit" if editable else "Edit (locked)", "Execution",
-                    f"Checklist ({sum(i.is_done for i in items)}/{len(items)})", "Links & references", "History"])
+    names = ["Overview", "Edit" if editable else "Edit (locked)", "Execution",
+             f"Checklist ({sum(i.is_done for i in items)}/{len(items)})", "Links & references", "History"]
+    show_ready = bool(ev_tasks) or has_pb
+    if show_ready:
+        names.insert(0, f"Readiness ({ready.done + ready.waived}/{ready.total - ready.not_needed})"
+                     if ev_tasks else "Readiness")
+    if has_pb and not items:
+        names.remove(next(n for n in names if n.startswith("Checklist")))
+    tab_objs = st.tabs(names)
+    by_name = dict(zip(names, tab_objs, strict=True))
+    tabs = [by_name[n] for n in names if not n.startswith("Readiness")]
+    checklist_shown = len(tabs) == 6
+    if not checklist_shown:  # playbook categories: tasks replace the free-text checklist
+        tabs.insert(3, None)
+    if show_ready:
+        with tab_objs[0]:
+            _readiness_tab(user, e, ev_tasks, ready, has_pb)
 
     with tabs[0]:
         _overview(e, parent, linked)
@@ -98,10 +125,13 @@ def render() -> None:
             if e.status == Status.APPROVED and not is_ho(user):
                 st.caption("Changing title, date, time or venue of an approved event sends it back for re-approval.")
             res = event_form(f"edit_{e.id}_{e.version}", user, e.category, e.centre_id, event=e, mode="edit")
+            res, late_reason = date_change_gate(f"edit_{e.id}_{e.version}_gate", user, e, res) if ev_tasks \
+                else (res, None)
             if res:
                 def do(s):
                     _, warnings = ev_svc.update_event(s, user, e.id, e.version, common=res["common"],
-                                                      details=res["details"], linked_event_id=res["linked"])
+                                                      details=res["details"], linked_event_id=res["linked"],
+                                                      late_reason=late_reason)
                     for w in warnings:
                         flash("warning", w)
                 run(do, "Changes saved.")
@@ -119,23 +149,24 @@ def render() -> None:
             st.markdown(f"**{cfg_a['label']}:** {e.actual_participation if e.actual_participation is not None else '—'}")
             st.markdown(f"**Post-event remarks:** {esc(e.post_event_remarks) or '—'}")
 
-    with tabs[3]:
-        locked = not manage or e.status in (Status.CANCELLED, Status.REJECTED)
-        if not items:
-            st.caption("No checklist items.")
-        for it in items:
-            c1, c2 = st.columns([10, 1])
-            c1.checkbox(it.label + (f"  ·  done {fmt_dt(it.done_at)}" if it.is_done and it.done_at else ""),
-                        value=it.is_done, key=f"chk_{it.id}", disabled=locked,
-                        on_change=_toggle, args=(user, it.id))
-            if not locked and c2.button("✕", key=f"chk_del_{it.id}", help="Remove item"):
-                run(lambda s: ev_svc.delete_checklist_item(s, user, it.id))
-        if not locked:
-            with st.form(f"chk_add_{e.id}", clear_on_submit=True, border=False):
-                c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
-                label = c1.text_input("New checklist item")
-                if c2.form_submit_button("Add"):
-                    run(lambda s: ev_svc.add_checklist_item(s, user, e.id, label))
+    if checklist_shown:
+        with tabs[3]:
+            locked = not manage or e.status in (Status.CANCELLED, Status.REJECTED)
+            if not items:
+                st.caption("No checklist items.")
+            for it in items:
+                c1, c2 = st.columns([10, 1])
+                c1.checkbox(it.label + (f"  ·  done {fmt_dt(it.done_at)}" if it.is_done and it.done_at else ""),
+                            value=it.is_done, key=f"chk_{it.id}", disabled=locked,
+                            on_change=_toggle, args=(user, it.id))
+                if not locked and c2.button("✕", key=f"chk_del_{it.id}", help="Remove item"):
+                    run(lambda s: ev_svc.delete_checklist_item(s, user, it.id))
+            if not locked:
+                with st.form(f"chk_add_{e.id}", clear_on_submit=True, border=False):
+                    c1, c2 = st.columns([5, 1], vertical_alignment="bottom")
+                    label = c1.text_input("New checklist item")
+                    if c2.form_submit_button("Add"):
+                        run(lambda s: ev_svc.add_checklist_item(s, user, e.id, label))
 
     with tabs[4]:
         for r in refs:
@@ -248,3 +279,36 @@ def _lookup() -> None:
             if digits:
                 open_event(int(digits))
     st.caption("Or pick an event from the calendar, dashboard or events list.")
+
+
+def _readiness_tab(user, e, ev_tasks, ready, has_pb) -> None:
+    if not ev_tasks:
+        st.info("This event has no preparation tasks (created before playbooks, or its playbook was added later).")
+        if has_pb and is_ho(user) and e.status not in (Status.CANCELLED, Status.REJECTED):
+            if st.button("Add playbook tasks to this event", type="primary", key=f"pb_add_{e.id}"):
+                run(lambda s: task_svc.apply_latest_playbook(s, user, e.id), "Playbook tasks added.")
+        return
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Readiness", ready.label)
+    c2.metric("Done", f"{ready.done + ready.waived}/{ready.total - ready.not_needed}",
+              help=f"{ready.done_late} done late · {ready.waived} waived")
+    c3.metric("Overdue", ready.overdue)
+    c4.metric("Blocked", ready.blocked)
+    c5.metric("Critical open (pre-event)", ready.critical_open)
+    if ready.reasons:
+        box = {"off_track": st.error, "blocked_ho": st.warning, "at_risk": st.warning}.get(ready.status, st.info)
+        box("  \n".join(ready.reasons))
+    task_table(ev_tasks, user, key=f"evtasks_{e.id}", hide=("Centre", "Event"))
+    with st.expander("Work on a task here"):
+        tid = st.selectbox("Task", [t.id for t in ev_tasks], key=f"evtask_pick_{e.id}",
+                           format_func=lambda i: next(f"{t.key} · {t.title}" for t in ev_tasks if t.id == i))
+        if tid:
+            task_panel(tid, user, key=f"evp_{e.id}")
+    versions = {t.playbook_version for t in ev_tasks}
+    if is_ho(user) and e.status not in (Status.CANCELLED, Status.REJECTED):
+        with db() as s:
+            pb = task_svc.active_playbook(s, e.category_id)
+        if pb and (max(v or 0 for v in versions) < pb.version):
+            st.caption(f"Built from playbook v{max(v or 0 for v in versions)}; the current version is v{pb.version}.")
+            if st.button(f"Apply playbook v{pb.version} (adds new tasks only)", key=f"pb_apply_{e.id}"):
+                run(lambda s: task_svc.apply_latest_playbook(s, user, e.id), "New playbook tasks added.")

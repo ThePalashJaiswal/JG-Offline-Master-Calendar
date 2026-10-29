@@ -8,9 +8,11 @@ import streamlit as st
 from jgevents.domain.constants import APPROVED_LIKE, LIVE_STATUSES, Status
 from jgevents.services import dashboard, directory, planning
 from jgevents.services import events as ev_svc
+from jgevents.services import tasks as task_svc
 from jgevents.services.events import EventFilter
 from jgevents.services.permissions import can_manage_centre
 from jgevents.utils.dates import add_months, fmt_date, month_bounds, month_label, today_ist
+from ui.components.tasks_ui import overdue_banner, task_table
 from ui.components.widgets import event_filters, events_table
 from ui.core import db, goto, me, month_picker, page_header
 
@@ -31,6 +33,7 @@ def centre_home() -> None:
         cid = centres[0].id
     centre = next(c for c in centres if c.id == cid)
     page_header(f"{centre.name} centre", f"Signed in as {user.full_name}")
+    overdue_banner(user, [cid])
 
     today = today_ist()
     ny, nm = add_months(today.year, today.month, 1)
@@ -72,8 +75,18 @@ def centre_home() -> None:
         "Needs outcome": [e for e in evs if e.status in (Status.APPROVED, Status.IN_PROGRESS) and e.event_date < today],
         "Completed & cancelled": [e for e in evs if e.status in (Status.COMPLETED, Status.CANCELLED, Status.REJECTED)],
     }
-    tabs = st.tabs([f"{k} ({len(v)})" for k, v in buckets.items()])
-    for tab, (name, items) in zip(tabs, buckets.items(), strict=True):
+    with db() as s:
+        my_tasks = task_svc.list_tasks(s, user, task_svc.TaskFilter(
+            centre_ids=[cid], date_to=today + timedelta(days=21), include_national=False))
+        my_tasks = [t for t in my_tasks if t.status == "open" and t.event.status not in ("cancelled", "rejected")]
+        for t in my_tasks:
+            _ = t.event, t.centre
+    my_tasks.sort(key=lambda t: (not task_svc.is_overdue(t), t.due_date))
+    tabs = st.tabs([f"Preparation tasks ({len(my_tasks)})"] + [f"{k} ({len(v)})" for k, v in buckets.items()])
+    with tabs[0]:
+        task_table(my_tasks, user, key="home_tasks", hide=("Centre",),
+                   empty="No open preparation tasks due in the next 3 weeks.")
+    for tab, (name, items) in zip(tabs[1:], buckets.items(), strict=True):
         with tab:
             events_table(items, key=f"home_{name}", empty=f"Nothing in “{name}”.")
 
